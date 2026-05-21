@@ -178,6 +178,15 @@
         font-size: 18px !important;
         padding: 16px !important;
       }
+      .btn-tanpa-struk {
+        background: #8b5cf6 !important;
+        font-size: 16px !important;
+        padding: 12px !important;
+        margin-top: 8px !important;
+      }
+      .btn-tanpa-struk:hover {
+        background: #7c3aed !important;
+      }
       
       .setting-row {
         margin-bottom: 15px;
@@ -394,6 +403,7 @@
         display: flex;
         gap: 10px;
         justify-content: flex-end;
+        flex-wrap: wrap;
       }
       .modal-footer button {
         width: auto;
@@ -405,6 +415,9 @@
       }
       .btn-konfirmasi-modal {
         background: var(--hijau) !important;
+      }
+      .btn-tanpa-struk-modal {
+        background: #8b5cf6 !important;
       }
       .detail-transaksi-modal {
         background: #f1f5f9;
@@ -907,8 +920,11 @@
               <div class="label">KEMBALIAN</div>
               <div class="angka">Rp <span id="kembalian">0</span></div>
             </div>
-            <button class="btn-selesai" id="btnSelesaiTransaksi" onclick="tampilkanModalKonfirmasi()">
-              ✅ CEK & SELESAIKAN
+            <button class="btn-selesai" id="btnSelesaiTransaksi" onclick="tampilkanModalKonfirmasi(true)">
+              ✅ CEK & CETAK STRUK
+            </button>
+            <button class="btn-tanpa-struk" onclick="tampilkanModalKonfirmasi(false)">
+              📱 CEK & TANPA CETAK
             </button>
             <button
               onclick="resetStruk()"
@@ -1179,7 +1195,8 @@
         </div>
         <div class="modal-footer">
           <button class="btn-batal-modal" onclick="tutupModal()">🔙 Batal</button>
-          <button class="btn-konfirmasi-modal" onclick="prosesTransaksi()">✅ Konfirmasi & Bayar</button>
+          <button class="btn-tanpa-struk-modal" id="modalBtnTanpaCetak">📱 Ya, Tanpa Cetak</button>
+          <button class="btn-konfirmasi-modal" id="modalBtnDenganCetak">🖨️ Ya, Cetak Struk</button>
         </div>
       </div>
     </div>
@@ -1506,7 +1523,6 @@
         document.getElementById("scanInput").classList.remove("cooldown");
       }
 
-      // SCAN MANUAL dengan debounce yang lebih baik
       document.getElementById("scanInput").addEventListener("keypress", function (e) {
         if (e.key === "Enter") {
           e.preventDefault();
@@ -1552,7 +1568,6 @@
         if (!inputCari.value.trim()) { inputCari.value = " "; inputCari.value = ""; }
       }
 
-      // Inisialisasi event listener cari manual hanya sekali
       if (!cariManualInitialized) {
         inputCari.addEventListener("input", function () {
           let q = this.value.trim().toLowerCase();
@@ -1721,8 +1736,125 @@
         document.getElementById("kembalian").innerText = kembali > 0 ? kembali.toLocaleString() : 0;
       }
 
+      // ========== FUNGSI PROSES TRANSAKSI YANG DIPERBAIKI ==========
+      async function prosesTransaksi(akanCetak) {
+        tutupModal();
+        
+        // Validasi stok
+        for (let item of struk) {
+          let barangDb = dbBarang.find(b => b.barcode === item.barcode);
+          if (!barangDb) {
+            alert(`Barang "${item.nama}" tidak ditemukan di database!`);
+            return;
+          }
+          if (barangDb.stok < item.qty) {
+            alert(`Stok "${item.nama}" tidak cukup! Tersedia: ${barangDb.stok}, Diminta: ${item.qty}`);
+            return;
+          }
+        }
+        
+        let totalJual = struk.reduce((a, b) => a + b.hargaJual * b.qty, 0);
+        let totalModal = struk.reduce((a, b) => a + b.hargaBeli * b.qty, 0);
+        let laba = totalJual - totalModal;
+        let bayar = parseInt(document.getElementById("bayar").value) || 0;
+        
+        if (bayar < totalJual) {
+          alert(`Uang bayar kurang! Total: Rp${totalJual.toLocaleString()}`);
+          return;
+        }
+        
+        // Simpan snapshot stok untuk rollback jika sync gagal
+        let snapshot = struk.map(item => {
+          let barang = dbBarang.find(b => b.barcode === item.barcode);
+          return { barcode: item.barcode, stokAwal: barang.stok };
+        });
+        
+        // Kurangi stok
+        for (let item of struk) {
+          let barang = dbBarang.find(b => b.barcode === item.barcode);
+          barang.stok -= item.qty;
+        }
+        
+        // Simpan transaksi ke database lokal
+        const waktuTransaksi = new Date().toLocaleString("id-ID");
+        const noStruk = "#" + Date.now().toString().slice(-6);
+        
+        dbTransaksi.push({ 
+          waktu: waktuTransaksi, 
+          totalJual: totalJual, 
+          totalModal: totalModal, 
+          laba: laba, 
+          item: struk.map(s => `${s.nama} x${s.qty}`).join(", ") 
+        });
+        
+        simpanDb();
+        
+        // Siapkan data untuk Google Sheet
+        const dataSheet = {
+          noStruk: noStruk,
+          waktu: waktuTransaksi,
+          item: struk.map(s => `${s.nama} x${s.qty}`).join(", "),
+          detailItem: struk.map(s => ({ nama: s.nama, qty: s.qty, harga: s.hargaJual, subtotal: s.hargaJual * s.qty })),
+          totalJual: totalJual,
+          totalModal: totalModal,
+          laba: laba,
+          perubahanStok: struk.map(s => ({ barcode: s.barcode, nama: s.nama, terjual: s.qty }))
+        };
+        
+        // Tampilkan loading pada tombol
+        const btnSelesai = document.getElementById("btnSelesaiTransaksi");
+        const originalText = btnSelesai.innerHTML;
+        btnSelesai.innerHTML = '<span class="loading-spinner"></span> Menyimpan...';
+        btnSelesai.disabled = true;
+        
+        try {
+          // Kirim ke Google Sheet (async, tidak perlu ditunggu selesai untuk cetak)
+          kirimKeGoogleSheet(dataSheet);
+          
+          // Cetak struk jika diperlukan
+          if (akanCetak) {
+            siapkanCetak(totalJual, bayar);
+            window.print();
+          }
+          
+          let pesanSukses = `Total: Rp${totalJual.toLocaleString()}\nLaba: Rp${laba.toLocaleString()}`;
+          if (!akanCetak) {
+            pesanSukses += "\n\n✅ Transaksi selesai tanpa cetak struk.";
+          }
+          tampilkanToast("Transaksi Berhasil!", pesanSukses);
+          
+          // Cek barang habis
+          let barangHabis = struk.filter(item => {
+            let barang = dbBarang.find(b => b.barcode === item.barcode);
+            return barang && barang.stok <= 0;
+          }).map(item => item.nama);
+          
+          if (barangHabis.length > 0) {
+            setTimeout(() => {
+              tampilkanToast("PERINGATAN STOK HABIS", `Barang berikut habis:\n${barangHabis.join(", ")}`, true);
+            }, 2500);
+          }
+          
+          resetStruk();
+        } catch (error) {
+          console.error("Error dalam transaksi:", error);
+          // Rollback stok jika terjadi error
+          for (let snap of snapshot) {
+            let barang = dbBarang.find(b => b.barcode === snap.barcode);
+            if (barang) barang.stok = snap.stokAwal;
+          }
+          dbTransaksi.pop(); // Hapus transaksi yang baru ditambahkan
+          simpanDb();
+          alert("Terjadi kesalahan dalam memproses transaksi. Stok telah dikembalikan.");
+          tampilkanToast("Transaksi Gagal", "Stok dikembalikan. Coba lagi.", true);
+        } finally {
+          btnSelesai.innerHTML = originalText;
+          btnSelesai.disabled = false;
+        }
+      }
+
       // === MODAL KONFIRMASI TRANSAKSI ===
-      function tampilkanModalKonfirmasi() {
+      function tampilkanModalKonfirmasi(cetakStruk = true) {
         if (struk.length === 0) {
           alert("Struk masih kosong! Tambahkan barang terlebih dahulu.");
           return;
@@ -1737,19 +1869,16 @@
         }
         
         // Cek stok sebelum konfirmasi
-        let stokMasalah = [];
         for (let item of struk) {
           let barangDb = dbBarang.find((b) => b.barcode === item.barcode);
           if (!barangDb) {
-            stokMasalah.push(`❌ Barang "${item.nama}" tidak ditemukan di database!`);
-          } else if (barangDb.stok < item.qty) {
-            stokMasalah.push(`❌ Stok "${item.nama}" tidak cukup! Tersedia: ${barangDb.stok}, Diminta: ${item.qty}`);
+            alert(`Barang "${item.nama}" tidak ditemukan di database!`);
+            return;
           }
-        }
-        
-        if (stokMasalah.length > 0) {
-          alert("Masalah Stok:\n" + stokMasalah.join("\n") + "\n\nSilakan perbaiki struk Anda.");
-          return;
+          if (barangDb.stok < item.qty) {
+            alert(`Stok "${item.nama}" tidak cukup! Tersedia: ${barangDb.stok}, Diminta: ${item.qty}`);
+            return;
+          }
         }
         
         // Siapkan detail untuk modal
@@ -1765,128 +1894,27 @@
         });
         
         modalBody.innerHTML = detailHtml;
-        document.getElementById("modalKonfirmasi").classList.add("show");
+        
+        // Tampilkan modal
+        const modal = document.getElementById("modalKonfirmasi");
+        modal.classList.add("show");
+        
+        // Hapus event listener lama dengan clone node
+        const btnDenganCetak = document.getElementById("modalBtnDenganCetak");
+        const btnTanpaCetak = document.getElementById("modalBtnTanpaCetak");
+        
+        const newBtnCetak = btnDenganCetak.cloneNode(true);
+        const newBtnTanpa = btnTanpaCetak.cloneNode(true);
+        btnDenganCetak.parentNode.replaceChild(newBtnCetak, btnDenganCetak);
+        btnTanpaCetak.parentNode.replaceChild(newBtnTanpa, btnTanpaCetak);
+        
+        // Pasang event listener baru
+        newBtnCetak.onclick = () => prosesTransaksi(true);
+        newBtnTanpa.onclick = () => prosesTransaksi(false);
       }
       
       function tutupModal() {
         document.getElementById("modalKonfirmasi").classList.remove("show");
-      }
-      
-      async function prosesTransaksi() {
-        tutupModal();
-        
-        let totalJual = struk.reduce((a, b) => a + b.hargaJual * b.qty, 0);
-        let totalModal = struk.reduce((a, b) => a + b.hargaBeli * b.qty, 0);
-        let laba = totalJual - totalModal;
-        let bayar = parseInt(document.getElementById("bayar").value) || 0;
-        
-        let stokMasalah = [];
-        let barangHabisList = [];
-
-        // Simpan snapshot stok sebelum perubahan untuk rollback
-        let stokSnapshot = [];
-        
-        for (let i = 0; i < struk.length; i++) {
-          let itemStruk = struk[i];
-          let barangDb = dbBarang.find((b) => b.barcode === itemStruk.barcode);
-          if (!barangDb) { 
-            stokMasalah.push(`Barang hilang: ${itemStruk.nama}`); 
-          } else if (barangDb.stok < itemStruk.qty) { 
-            stokMasalah.push(`Stok tidak cukup untuk ${itemStruk.nama}. Minta: ${itemStruk.qty}, Sisa: ${barangDb.stok}`); 
-          } else {
-            stokSnapshot.push({
-              barcode: itemStruk.barcode,
-              stokAwal: barangDb.stok
-            });
-          }
-        }
-        
-        if (stokMasalah.length > 0) { 
-          alert("⛔ TRANSAKSI DIBATALKAN!\n\n" + stokMasalah.join("\n") + "\n\nSilakan periksa stok atau kurangi jumlah barang."); 
-          return; 
-        }
-
-        // Kurangi stok
-        let perubahanStok = [];
-        struk.forEach((s) => { 
-          let b = dbBarang.find((x) => x.barcode === s.barcode);
-          if (b) {
-            let stokSebelum = b.stok;
-            b.stok -= s.qty;
-            let stokSesudah = b.stok;
-            
-            perubahanStok.push({
-              barcode: s.barcode,
-              nama: s.nama,
-              stokSebelum: stokSebelum,
-              stokSesudah: stokSesudah,
-              terjual: s.qty
-            });
-            
-            if (b.stok <= 0) barangHabisList.push(b.nama);
-          }
-        });
-
-        const noStruk = "#" + Date.now().toString().slice(-6);
-        const waktuTransaksi = new Date().toLocaleString("id-ID");
-
-        const dataSheet = {
-          noStruk: noStruk,
-          waktu: waktuTransaksi,
-          item: struk.map((s) => `${s.nama} x${s.qty}`).join(", "),
-          detailItem: struk.map((s) => ({ nama: s.nama, qty: s.qty, harga: s.hargaJual, subtotal: s.hargaJual * s.qty })),
-          totalJual: totalJual,
-          totalModal: totalModal,
-          laba: laba,
-          perubahanStok: perubahanStok
-        };
-
-        // Simpan transaksi ke localStorage terlebih dahulu
-        dbTransaksi.push({ 
-          waktu: waktuTransaksi, 
-          totalJual: totalJual, 
-          totalModal: totalModal, 
-          laba: laba, 
-          item: struk.map((s) => `${s.nama} x${s.qty}`).join(", ") 
-        });
-        
-        siapkanCetak(totalJual, bayar);
-        simpanDb();
-        
-        const btnSelesai = document.getElementById("btnSelesaiTransaksi");
-        const originalText = btnSelesai.innerHTML;
-        btnSelesai.innerHTML = '<span class="loading-spinner"></span> Menyimpan...';
-        btnSelesai.disabled = true;
-        
-        try {
-          await kirimKeGoogleSheet(dataSheet);
-          
-          tampilkanToast("Transaksi Berhasil!", `Total: Rp${totalJual.toLocaleString()}\nLaba: Rp${laba.toLocaleString()}`);
-          
-          if (barangHabisList.length > 0) {
-            setTimeout(() => {
-              tampilkanToast("PERINGATAN STOK HABIS", `Barang berikut habis:\n${barangHabisList.join(", ")}`, true);
-            }, 2500);
-          }
-          
-          window.print();
-          resetStruk();
-        } catch (error) {
-          console.error("Transaksi gagal disync, melakukan rollback...", error);
-          // Rollback stok
-          for (let ss of stokSnapshot) {
-            let b = dbBarang.find(x => x.barcode === ss.barcode);
-            if (b) b.stok = ss.stokAwal;
-          }
-          // Hapus transaksi dari dbTransaksi
-          dbTransaksi.pop();
-          simpanDb();
-          alert("Gagal menyimpan transaksi ke Cloud. Stok dikembalikan. Cek koneksi internet Anda.\n\nCatatan: Transaksi tetap tersimpan di struk cetak jika sudah terlanjur print.");
-          tampilkanToast("Transaksi Gagal", "Stok dikembalikan. Cek koneksi internet.", true);
-        } finally {
-          btnSelesai.innerHTML = originalText;
-          btnSelesai.disabled = false;
-        }
       }
 
       function siapkanCetak(total, bayar) {
